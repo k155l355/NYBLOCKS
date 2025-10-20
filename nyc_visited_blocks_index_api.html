@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NYC Visited Blocks — API Mode</title>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet">
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+  <link rel="stylesheet" href="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-geocoder/v5.0.1/mapbox-gl-geocoder.css" type="text/css" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-geocoder/v5.0.1/mapbox-gl-geocoder.min.js"></script>
+  <style>
+    :root{ --bg:#0b0e11; --panel:#12161b; --muted:#778; --text:#eaeef3; --accent:#2dd4bf; }
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Helvetica,Arial,sans-serif}
+    #app{position:fixed;inset:0;display:grid;grid-template-rows:auto 1fr}
+    header{display:flex;gap:.75rem;align-items:center;padding:.6rem .8rem;background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(0,0,0,.08));border-bottom:1px solid rgba(255,255,255,.08)}
+    header .title{font-weight:700;letter-spacing:.3px}
+    header .spacer{flex:1}
+    header .pill{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);padding:.35rem .6rem;border-radius:999px;font-size:.9rem}
+    header button{border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.06);color:var(--text);padding:.45rem .7rem;border-radius:.6rem;cursor:pointer}
+    header button:hover{border-color:rgba(255,255,255,.2)}
+    #map{position:relative;height:100%}
+    .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111b;backdrop-filter:saturate(140%) blur(10px);color:var(--text);padding:.6rem .8rem;border:1px solid rgba(255,255,255,.15);border-radius:.6rem;opacity:0;pointer-events:none;transition:opacity .2s ease}
+    .toast.show{opacity:1}
+    .legend{position:absolute;bottom:14px;left:14px;background:rgba(0,0,0,.5);border:1px solid rgba(255,255,255,.15);border-radius:.6rem;padding:.5rem .6rem;font-size:.9rem}
+    .legend .row{display:flex;gap:.6rem;align-items:center;margin:.2rem 0}
+    .swatch{width:14px;height:14px;border-radius:3px;border:1px solid rgba(255,255,255,.25)}
+    .visited{background:var(--accent)}
+    .unvisited{background:#808a98}
+  </style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="title">NYC Visited Blocks — API Mode</div>
+    <div id="geocoder" style="min-width:280px"></div>
+    <div class="spacer"></div>
+    <div class="pill" id="counter">Visited: 0</div>
+    <div class="pill" id="boroughs">MN:0 BX:0 BK:0 QN:0 SI:0</div>
+    <button id="exportBtn">Export</button>
+    <button id="importBtn">Import</button>
+    <input id="importFile" type="file" accept="application/json" style="display:none"/>
+  </header>
+  <div id="map"></div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+// =====================
+// 1) CONFIG — EDIT ME
+// =====================
+const MAPBOX_TOKEN = 'YOUR_MAPBOX_ACCESS_TOKEN_HERE';
+// NYC Open Data (Socrata) TAX_BLOCK_POLYGON dataset ID (commonly 'akq4-haa2')
+const SODA_DOMAIN = 'data.cityofnewyork.us';
+const DATASET_ID  = 'akq4-haa2';
+// Optional: create a free app token in your NYC Open Data profile and paste it here
+const SODA_APP_TOKEN = ''; // e.g., 'abcdEFGHijkl1234'
+// Property field names (case-insensitive handled below)
+const FIELD_BORO  = 'BORO';
+const FIELD_BLOCK = 'BLOCK';
+// Max features per request (tuned for viewport)
+const SODA_LIMIT = 50000;
+
+const NYC_CENTER = [-73.9712, 40.72];
+const NYC_ZOOM   = 10.2;
+const NYC_BBOX   = [-74.3, 40.45, -73.65, 40.95];
+
+// =====================
+// 2) STATE & HELPERS
+// =====================
+const LS_KEY = 'visitedBlocks.v1';
+const visited = new Set(JSON.parse(localStorage.getItem(LS_KEY) || '[]'));
+const BORO_LABELS = { '1':'MN', '2':'BX', '3':'BK', '4':'QN', '5':'SI' };
+
+function getProp(obj, key){ return obj[key] ?? obj[key.toLowerCase()] ?? obj[key.toUpperCase()]; }
+function keyFromProps(props){
+  const b = getProp(props, FIELD_BORO); const blk = getProp(props, FIELD_BLOCK);
+  return `${b}-${blk}`;
+}
+function save(){ localStorage.setItem(LS_KEY, JSON.stringify([...visited])); }
+function toast(msg){ const el = document.getElementById('toast'); el.textContent = msg; el.classList.add('show'); setTimeout(()=>el.classList.remove('show'), 1100); }
+function computeBoroughCounts(){ const c={'1':0,'2':0,'3':0,'4':0,'5':0}; visited.forEach(k=>{ const [b]=k.split('-'); if(c[b]!=null) c[b]++; }); return c; }
+function syncCounters(){ const bc=computeBoroughCounts(); document.getElementById('counter').textContent=`Visited: ${visited.size}`; document.getElementById('boroughs').textContent=`MN:${bc['1']} BX:${bc['2']} BK:${bc['3']} QN:${bc['4']} SI:${bc['5']}`; }
+function fmtDateISO(){ const d=new Date(); const p=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}`; }
+
+// Paint expression that colors visited blocks using case-insensitive props via coalesce
+function makeFillExpression(){
+  const arr = Array.from(visited);
+  return [
+    'case',
+    ['in',
+      ['concat',
+        ['to-string', ['coalesce', ['get', FIELD_BORO], ['get', FIELD_BORO.toLowerCase()], ['get', FIELD_BORO.toUpperCase()]]],
+        '-',
+        ['to-string', ['coalesce', ['get', FIELD_BLOCK], ['get', FIELD_BLOCK.toLowerCase()], ['get', FIELD_BLOCK.toUpperCase()]]]
+      ],
+      ['literal', arr]
+    ],
+    ['interpolate', ['linear'], ['zoom'], 9, '#26c2b8', 13, '#2dd4bf'], // visited
+    '#808a98' // unvisited
+  ];
+}
+
+// =====================
+// 3) MAP + API-DRIVEN SOURCE
+// =====================
+mapboxgl.accessToken = MAPBOX_TOKEN;
+const map = new mapboxgl.Map({
+  container: 'map', style: 'mapbox://styles/mapbox/streets-v12', center: NYC_CENTER, zoom: NYC_ZOOM
+});
+
+const geocoder = new MapboxGeocoder({ accessToken: mapboxgl.accessToken, mapboxgl, marker:false, bbox: NYC_BBOX, placeholder: 'Search NYC address or place…' });
+map.addControl(geocoder, 'top-left');
+
+// Create an empty GeoJSON source we'll refill on view changes
+const EMPTY_FC = { type:'FeatureCollection', features:[] };
+
+map.on('load', () => {
+  map.addSource('blocks', { type:'geojson', data: EMPTY_FC });
+  map.addLayer({ id:'blocks-fill', type:'fill', source:'blocks', paint:{ 'fill-color': makeFillExpression(), 'fill-opacity': ['interpolate',['linear'],['zoom'],9,0.6,13,0.45 ] } });
+  map.addLayer({ id:'blocks-outline', type:'line', source:'blocks', paint:{ 'line-color':'#4f5966', 'line-width':['interpolate',['linear'],['zoom'],9,0.3,13,0.6] } });
+
+  // Click to toggle
+  map.on('click', 'blocks-fill', (e)=>{
+    const f = e.features && e.features[0]; if(!f) return;
+    const key = keyFromProps(f.properties||{});
+    if(!key || key==='-') return;
+    if(visited.has(key)) { visited.delete(key); toast('Unmarked block'); } else { visited.add(key); toast('Marked visited'); }
+    save(); map.setPaintProperty('blocks-fill','fill-color', makeFillExpression()); syncCounters();
+  });
+
+  // Load first batch and then on moveend (debounced)
+  loadBlocksInView();
+  let t=null; map.on('moveend', ()=>{ clearTimeout(t); t=setTimeout(loadBlocksInView, 120); });
+  syncCounters();
+});
+
+function sodaURLForBounds(bounds){
+  // Socrata within_box(the_geom, north, west, south, east) — GeoJSON output
+  const sw = bounds.getSouthWest(); const ne = bounds.getNorthEast();
+  const params = new URLSearchParams();
+  params.set('$limit', String(SODA_LIMIT));
+  params.set('$select', `${FIELD_BORO},${FIELD_BLOCK},the_geom`);
+  params.set('$where', `within_box(the_geom, ${ne.lat}, ${sw.lng}, ${sw.lat}, ${ne.lng})`);
+  if (SODA_APP_TOKEN) params.set('$$app_token', SODA_APP_TOKEN);
+  return `https://${SODA_DOMAIN}/resource/${DATASET_ID}.geojson?${params.toString()}`;
+}
+
+async function loadBlocksInView(){
+  const url = sodaURLForBounds(map.getBounds());
+  try{
+    const resp = await fetch(url);
+    if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const gj = await resp.json();
+    // Ensure features are polygons and have required fields
+    gj.features = (gj.features||[]).filter(feat => {
+      const p = feat.properties||{}; const b = getProp(p, FIELD_BORO); const bl = getProp(p, FIELD_BLOCK);
+      return (feat.geometry && (feat.geometry.type==='Polygon' || feat.geometry.type==='MultiPolygon') && b!=null && bl!=null);
+    });
+    const src = map.getSource('blocks');
+    if(src) src.setData(gj);
+    // refresh styling to reflect any newly visible visited IDs
+    map.setPaintProperty('blocks-fill','fill-color', makeFillExpression());
+  } catch(err){ console.error('SODA fetch failed', err); toast('Could not load blocks from API'); }
+}
+
+// Export/Import controls
+const exportBtn=document.getElementById('exportBtn');
+const importBtn=document.getElementById('importBtn');
+const importFile=document.getElementById('importFile');
+
+exportBtn.addEventListener('click', ()=>{
+  const data={version:1, created:new Date().toISOString(), keys:[...visited]};
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=`nyc-visited-blocks-${fmtDateISO()}.json`; document.body.appendChild(a); a.click(); a.remove();
+});
+
+importBtn.addEventListener('click', ()=>importFile.click());
+importFile.addEventListener('change', (ev)=>{
+  const file=ev.target.files[0]; if(!file) return; const reader=new FileReader();
+  reader.onload = (e)=>{
+    try{ const obj=JSON.parse(e.target.result);
+      visited.clear();
+      (Array.isArray(obj)?obj:(obj&&obj.keys)||[]).forEach(k=>visited.add(k));
+      save(); map.setPaintProperty('blocks-fill','fill-color', makeFillExpression()); syncCounters(); toast('Import successful');
+    } catch(err){ alert('Import failed: '+err.message); }
+  };
+  reader.readAsText(file); ev.target.value='';
+});
+</script>
+</body>
+</html>
